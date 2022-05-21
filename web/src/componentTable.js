@@ -1,4 +1,4 @@
-import { db } from "./db";
+import { db, cancellableDexieQuery } from "./db";
 import React from "react";
 import { produce, enableMapSet } from "immer";
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
@@ -42,15 +42,6 @@ function attributeComparator(x, y, valueType = undefined) {
     );
 }
 
-function fullTextComponentsFilter(component, words) {
-    let text = componentText(component);
-    for (let word of words) {
-        if (!text.includes(word))
-            return false;
-    }
-    return true;
-}
-
 function componentText(component) {
     return(
         component.lcsc + " " +
@@ -84,39 +75,6 @@ export function restoreLcscUrl(slug, lcsc) {
 
 function valueFootprint(value) {
     return JSON.stringify(value);
-}
-
-// Filter an array asynchronously without excessively blocking UI
-function filterByChunks(array, predicate, chunkSize) {
-    let result = [];
-    let idx = 0;
-    let resolve = null;
-    let fail = null;
-    let aborted = false;
-    let filter = () => {
-        if (aborted) {
-            fail("Aborted");
-            return;
-        }
-        let chunk = chunkSize;
-        while (chunk-- && idx < array.length) {
-            if (predicate(array[idx]))
-                result.push(array[idx]);
-            ++idx;
-        }
-        if (idx < array.length) {
-            setTimeout(filter, 0);
-        } else {
-            resolve(result);
-        }
-    };
-    let promise = new Promise((r, f) => {
-        resolve = r;
-        fail = f;
-        setTimeout(filter, 0);
-    });
-    let abortFunction = () => { aborted = true; }
-    return [promise, abortFunction];
 }
 
 export function Spinbox() {
@@ -680,7 +638,7 @@ class CategoryFilter extends React.Component {
             categories: {},
             allCategories: false,
             searchString: "",
-            abort: () => {}
+            abort: null
         }
     }
 
@@ -705,47 +663,33 @@ class CategoryFilter extends React.Component {
     // Return query containing components based on current categories and
     // full-text search
     async components() {
-        this.state.abort();
+        if (this.state.abort)
+            this.state.abort(); // optional chaining not supported
         let query;
-        if (this.state.allCategories)
+        if (this.state.allCategories) {
+            if (this.state.searchString.length < 3) { // prevent high ram usage
+                return [];
+            }
             query = db.components;
+        }
         else
             query = db.components.where("category").anyOf(this.collectActiveCategories());
-        // In theory, we should be able to cancel transactions, however, it seems not to be necessary
-        // Leaving this code here for future reference
-        // let [componentsPromise, cAbort] = cancellableDexieQuery("components", () => query.toArray());
-        // this.setState({"abort": cAbort});
-        // let components = await componentsPromise.catch(_ => []);
-        // this.setState({"abort": () =>{}});
-        let components =  null;
-        try {
-            components = await query.toArray();
-        } catch( err ) {
-            // This is a temporary notification for Firefox users
-            alert("Fatal error ocurred - see below.\n\n" +
-                "If you use Firefox, please see https://github.com/yaqwsx/jlcparts/issues/33. for further information\n" +
-                "Otherwise, please report this as a bug. Error information: \n" +
-                err.toString())
-                window.location.reload()
+        if (this.state.searchString.length !== 0) {
+            let words = this.state.searchString.split(/\s+/)
+                .filter(x => x.length > 0)
+                .map(x => x.toLocaleLowerCase());
+            if (words.length !== 0) {
+                query = query.filter(component => {
+                    let text = componentText(component);
+                    return words.every(word => text.includes(word));
+                });
+            }
         }
-        if (this.state.searchString.length === 0)
-            return components;
-
-        let words = this.state.searchString.split(/\s+/)
-            .filter(x => x.length > 0)
-            .map(x => x.toLocaleLowerCase());
-        if (words.length === 0)
-            return components;
-        console.log("Starting search...");
-        let t0 = performance.now()
-        let [filteredPromise, fAbort] = await filterByChunks(components,
-            component => fullTextComponentsFilter(component, words), 2000);
-        this.setState({"abort": fAbort});
-        let filtered = await filteredPromise.catch(_ => []);
-        this.setState({"abort": () =>{}});
-        let t1 = performance.now();
-        console.log("Search took", t1 - t0, "ms");
-        return filtered;
+        let [componentsPromise, cAbort] = cancellableDexieQuery(db.components, () => query.toArray());
+        this.setState({abort: cAbort});
+        let components = await componentsPromise.catch(_ => []);
+        this.setState({abort: null});
+        return components;
     }
 
     handleCategoryChange = (category, value) => {
